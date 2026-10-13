@@ -41,7 +41,7 @@ class Employee(db.Model):
     id=db.Column(db.String(40),primary_key=True); name=db.Column(db.String(160),nullable=False)
     designation=db.Column(db.String(40),nullable=False); joining_date=db.Column(db.Date,nullable=False)
     phone=db.Column(db.String(40)); email=db.Column(db.String(160)); status=db.Column(db.String(30),default="Active")
-    site_ids=db.Column(db.Text,default=""); shift=db.Column(db.String(40)); basic_salary=db.Column(db.Float,default=0)
+    site_ids=db.Column(db.Text,default=""); manager_employee_id=db.Column(db.String(40)); shift=db.Column(db.String(40)); basic_salary=db.Column(db.Float,default=0)
     food_allowance=db.Column(db.Float,default=0); attendance_bonus=db.Column(db.Float,default=0)
 class Site(db.Model):
     id=db.Column(db.String(40),primary_key=True); name=db.Column(db.String(160),nullable=False)
@@ -58,7 +58,7 @@ class Attendance(db.Model):
     __table_args__=(UniqueConstraint("date","employee_id",name="uq_attendance_date_employee"),)
 class Advance(db.Model):
     id=db.Column(db.String(40),primary_key=True); employee_id=db.Column(db.String(40),nullable=False); issue_date=db.Column(db.Date,nullable=False)
-    amount=db.Column(db.Float,nullable=False); approval_status=db.Column(db.String(20),default="Pending"); recovery_month=db.Column(db.String(7),nullable=False)
+    amount=db.Column(db.Float,nullable=False); monthly_recovery=db.Column(db.Float,default=0); approval_status=db.Column(db.String(20),default="Pending"); recovery_month=db.Column(db.String(7),nullable=False)
     recovered_amount=db.Column(db.Float,default=0); notes=db.Column(db.String(255)); recovered_payroll_id=db.Column(db.String(80))
 class Payroll(db.Model):
     id=db.Column(db.String(80),primary_key=True); employee_id=db.Column(db.String(40),nullable=False); month=db.Column(db.String(7),nullable=False)
@@ -116,36 +116,76 @@ def roles(*allowed):
     return deco
 def site_ids_for_user():
     u=g.user
-    if u.role=="Director":return None
-    return {x.strip() for x in (u.site_ids or "").split(",") if x.strip()}
+    if u.role=="Director": return None
+    ids={x.strip() for x in (u.site_ids or "").split(",") if x.strip()}
+    if u.role=="Manager" and u.employee_id:
+        ids.update(s.id for s in Site.query.filter_by(manager_employee_id=u.employee_id,status="Active").all())
+    return ids
+
 def authorized_site(site_id):
     allowed=site_ids_for_user()
     return allowed is None or site_id in allowed
+
 def next_id(prefix,model):
     return f"{prefix}-{secrets.token_hex(4).upper()}"
+
 def employee_payload(e):
-    d=asdict(e);d["site_ids"]=[x for x in (e.site_ids or "").split(",") if x];return d
+    d=asdict(e)
+    d["site_ids"]=[x for x in (e.site_ids or "").split(",") if x]
+    manager=db.session.get(Employee,e.manager_employee_id) if e.manager_employee_id else None
+    d["manager_name"]=manager.name if manager else ""
+    d["site_names"]=[site.name for sid in d["site_ids"] if (site:=db.session.get(Site,sid))]
+    return d
+
 def payroll_calc(emp,month):
-    rows=Attendance.query.filter_by(employee_id=emp.id).filter(Attendance.date>=datetime.date.fromisoformat(month+"-01")).filter(Attendance.date<=(datetime.date.fromisoformat(month+"-01")+datetime.timedelta(days=40))).all()
-    rows=[x for x in rows if x.date.strftime("%Y-%m")==month]
+    first=datetime.date.fromisoformat(month+"-01")
+    next_month=(first.replace(day=28)+datetime.timedelta(days=4)).replace(day=1)
+    rows=Attendance.query.filter(Attendance.employee_id==emp.id,Attendance.date>=first,Attendance.date<next_month).all()
     absent=sum(1 for x in rows if x.code=="A")
-    grace=int(setting("absence_grace_days",2));div=max(float(setting("salary_divisor",30)),1)
-    chargeable=max(0,absent-grace);absence=round(chargeable*(emp.basic_salary or 0)/div,2)
-    bonus=emp.attendance_bonus or 0
-    # Advance recovery only once; same-month approved advances, not already tied to payroll.
+    grace=max(0,int(setting("absence_grace_days",2)))
+    divisor=max(float(setting("salary_divisor",30)),1)
+    chargeable=max(0,absent-grace)
+    absence=round(chargeable*(emp.basic_salary or 0)/divisor,2)
+    bonus=float(emp.attendance_bonus or 0)
+    if absent>=3: bonus=0
+    elif absent==2: bonus=max(0,bonus-float(setting("bonus_cut_two_absences",800)))
     payroll_id=f"{emp.id}:{month}"
-    advs=Advance.query.filter_by(employee_id=emp.id,recovery_month=month,approval_status="Approved").all()
-    adv_amount=sum(max(0,(a.amount or 0)-(a.recovered_amount or 0)) for a in advs if not a.recovered_payroll_id)
+    advs=Advance.query.filter(Advance.employee_id==emp.id,Advance.recovery_month<=month,Advance.approval_status=="Approved").order_by(Advance.issue_date.asc()).all()
+    adv_amount=sum(min(max(0,(a.amount or 0)-(a.recovered_amount or 0)),max(0,(a.monthly_recovery or 0) or (a.amount or 0))) for a in advs)
     ot_rate=float(setting("ot_rate",0));wo_rate=float(setting("wo_ot_rate",0))
-    ot_pay=sum((x.ot_hours or 0)*(wo_rate if x.code=="WO-OT" else ot_rate) for x in rows if x.code in ("OT","WO-OT"))
-    basic=emp.basic_salary or 0;food=emp.food_allowance or 0
-    pf_rate=float(setting("pf_rate",0));esi_rate=float(setting("esi_rate",0))
-    pf=round(basic*pf_rate/100,2);esi=round(basic*esi_rate/100,2)
-    gross=round(basic+food+bonus+ot_pay,2);net=round(gross-absence-pf-esi-adv_amount,2)
+    ot_pay=round(sum((x.ot_hours or 0)*(wo_rate if x.code=="WO-OT" else ot_rate) for x in rows if x.code in ("OT","WO-OT")),2)
+    basic=float(emp.basic_salary or 0);food=float(emp.food_allowance or 0)
+    pf=round(basic*float(setting("pf_rate",0))/100,2);esi=round(basic*float(setting("esi_rate",0))/100,2)
+    gross=round(basic+food+bonus+ot_pay,2)
+    net=round(gross-absence-pf-esi-adv_amount,2)
     return dict(id=payroll_id,employee_id=emp.id,month=month,basic_salary=basic,food_allowance=food,bonus_payable=bonus,ot_pay=ot_pay,absence_days=absent,absence_deduction=absence,pf_deduction=pf,esi_deduction=esi,advance_recovery=adv_amount,other_deductions=0,gross_pay=gross,net_pay=net,status="Draft",requires_review=False)
+
 def ensure_site_limit(employee_id,site_ids):
     manager=Employee.query.filter_by(id=employee_id,designation="Manager").first()
-    if manager and len(set(site_ids))>int(setting("manager_site_limit",3)): raise ValueError("Manager may have up to three active sites")
+    if manager and len(set(site_ids))>int(setting("manager_site_limit",20)):
+        raise ValueError(f"Manager may have up to {setting('manager_site_limit',20)} active sites")
+
+def manager_site_ids(employee_id):
+    return {s.id for s in Site.query.filter_by(manager_employee_id=employee_id,status="Active").all()}
+
+def migrate_additive_columns():
+    # create_all does not add columns to tables already present in PostgreSQL/SQLite.
+    from sqlalchemy import inspect, text
+    try:
+        inspector=inspect(db.engine)
+        if "employee" in inspector.get_table_names():
+            cols={c["name"] for c in inspector.get_columns("employee")}
+            if "manager_employee_id" not in cols:
+                db.session.execute(text("ALTER TABLE employee ADD COLUMN manager_employee_id VARCHAR(40)"))
+                db.session.commit()
+        if "advance" in inspector.get_table_names():
+            cols={c["name"] for c in inspector.get_columns("advance")}
+            if "monthly_recovery" not in cols:
+                db.session.execute(text("ALTER TABLE advance ADD COLUMN monthly_recovery FLOAT DEFAULT 0"))
+                db.session.commit()
+    except Exception:
+        db.session.rollback()
+
 def json_body(): return request.get_json(silent=True) or {}
 @app.get("/api/health")
 def health(): return jsonify(status="ok",service="svsa-api")
@@ -170,15 +210,21 @@ def dashboard():
     if allowed is not None:q=q.filter(Attendance.site_id.in_(allowed))
     ar=[x for x in q.all() if x.date.strftime("%Y-%m")==month]
     employees=Employee.query.filter_by(status="Active").all()
-    if allowed is not None:employees=[e for e in employees if set((e.site_ids or "").split(","))&allowed]
-    payroll=Payroll.query.filter_by(month=month).all()
+    if allowed is not None:
+        if g.user.role=="Manager": employees=[e for e in employees if e.designation in ("Security Guard","Supervisor") and e.manager_employee_id==g.user.employee_id]
+        else: employees=[e for e in employees if set((e.site_ids or "").split(","))&allowed]
+    payroll=Payroll.query.filter_by(month=month).all() if g.user.role=="Director" else []
     if allowed is not None:payroll=[p for p in payroll if (db.session.get(Employee,p.employee_id) and set((db.session.get(Employee,p.employee_id).site_ids or "").split(","))&allowed)]
-    return jsonify(total_employees=len(employees),active_sites=Site.query.filter_by(status="Active").count() if allowed is None else Site.query.filter(Site.id.in_(allowed),Site.status=="Active").count(),present=sum(x.code=="P" for x in ar),absent=sum(x.code=="A" for x in ar),weekly_off=sum(x.code=="WO" for x in ar),holiday=sum(x.code=="H" for x in ar),overtime_entries=sum(x.code in ("OT","WO-OT") for x in ar),missing_attendance=0,pending_payroll=sum(p.status in ("Draft","Reviewed") for p in payroll),net_payroll=sum(p.net_pay or 0 for p in payroll),advance_outstanding=sum(max(0,a.amount-a.recovered_amount) for a in Advance.query.all() if a.approval_status=="Approved" and (allowed is None or a.employee_id in {e.id for e in employees})))
+    return jsonify(total_employees=len(employees),active_sites=Site.query.filter_by(status="Active").count() if allowed is None else Site.query.filter(Site.id.in_(allowed),Site.status=="Active").count(),present=sum(x.code=="P" for x in ar),absent=sum(x.code=="A" for x in ar),weekly_off=sum(x.code=="WO" for x in ar),holiday=sum(x.code=="H" for x in ar),overtime_entries=sum(x.code in ("OT","WO-OT") for x in ar),missing_attendance=0,pending_payroll=sum(p.status in ("Draft","Reviewed") for p in payroll),net_payroll=sum(p.net_pay or 0 for p in payroll),advance_outstanding=(sum(max(0,a.amount-a.recovered_amount) for a in Advance.query.all() if a.approval_status=="Approved" and (allowed is None or a.employee_id in {e.id for e in employees})) if g.user.role=="Director" else 0))
 @app.get("/api/employees")
 @token_required
 def employees_list():
     items=Employee.query.all();allowed=site_ids_for_user()
-    if allowed is not None:items=[e for e in items if set((e.site_ids or "").split(","))&allowed]
+    if allowed is not None:
+        if g.user.role=="Manager": items=[e for e in items if e.designation in ("Security Guard","Supervisor") and e.manager_employee_id==g.user.employee_id and bool({x.strip() for x in (e.site_ids or "").split(",") if x.strip()}&allowed)]
+        else: items=[e for e in items if set((e.site_ids or "").split(","))&allowed]
+    if g.user.role!="Director":
+        return jsonify(items=[{"id":e.id,"name":e.name,"designation":e.designation,"status":e.status,"shift":e.shift,"site_ids":[x.strip() for x in (e.site_ids or "").split(",") if x.strip()]} for e in items])
     return jsonify(items=[employee_payload(x) for x in items])
 @app.post("/api/employees")
 @roles("Director")
@@ -187,9 +233,14 @@ def employee_create():
     if not d.get("name") or not d.get("joining_date"):return jsonify(error="Name and joining date are required"),400
     sites=[x.strip() for x in (d.get("site_ids") or "").split(",") if x.strip()]
     if any(not db.session.get(Site,x) for x in sites):return jsonify(error="One or more Site IDs do not exist"),400
+    manager_id=(d.get("manager_employee_id") or "").strip() or None
+    if manager_id:
+        manager=db.session.get(Employee,manager_id)
+        if not manager or manager.designation!="Manager": return jsonify(error="Select a valid Manager employee"),400
+        if designation not in ("Security Guard","Supervisor"): return jsonify(error="Only Guards and Supervisors can be assigned to a Manager"),400
     eid=next_id("EMP",Employee)
-    salary=45000 if designation=="Director" else float(d.get("basic_salary") or 0)
-    e=Employee(id=eid,name=d["name"].strip(),designation=designation,joining_date=parse_date(d["joining_date"],True),phone=d.get("phone"),email=d.get("email"),status=d.get("status","Active"),site_ids=",".join(sites),shift=d.get("shift"),basic_salary=salary,food_allowance=float(d.get("food_allowance") or 0),attendance_bonus=float(d.get("attendance_bonus") or 0))
+    salary=float(setting("director_salary",45000)) if designation=="Director" else float(d.get("basic_salary") or 0)
+    e=Employee(id=eid,name=d["name"].strip(),designation=designation,joining_date=parse_date(d["joining_date"],True),phone=d.get("phone"),email=d.get("email"),status=d.get("status","Active"),site_ids=",".join(sites),manager_employee_id=manager_id,shift=d.get("shift"),basic_salary=salary,food_allowance=float(d.get("food_allowance") or 0),attendance_bonus=float(d.get("attendance_bonus") or 0))
     try:
         db.session.add(e);db.session.flush()
         if designation=="Manager":
@@ -207,6 +258,12 @@ def employee_update(eid):
         if k in d:setattr(e,k,d[k])
     if "joining_date" in d:e.joining_date=parse_date(d["joining_date"],True)
     if "designation" in d:e.designation=d["designation"]
+    if "manager_employee_id" in d:
+        mid=(d.get("manager_employee_id") or "").strip() or None
+        manager=db.session.get(Employee,mid) if mid else None
+        if mid and (not manager or manager.designation!="Manager"): return jsonify(error="Select a valid Manager employee"),400
+        if mid and e.designation not in ("Security Guard","Supervisor"): return jsonify(error="Only Guards and Supervisors can be assigned to a Manager"),400
+        e.manager_employee_id=mid
     if "basic_salary" in d and e.designation!="Director":e.basic_salary=float(d["basic_salary"] or 0)
     if e.designation=="Director":e.basic_salary=45000
     if "site_ids" in d:
@@ -219,8 +276,10 @@ def employee_update(eid):
 @token_required
 def sites_list():
     items=Site.query.all();allowed=site_ids_for_user()
-    if allowed is not None:items=[s for s in items if s.id in allowed]
-    return jsonify(items=[asdict(x) for x in items])
+    if allowed is not None:
+        if g.user.role=="Manager": items=[site for site in items if site.manager_employee_id==g.user.employee_id and site.status=="Active"]
+        else: items=[site for site in items if site.id in allowed]
+    return jsonify(items=[{**asdict(x),"manager_name":(db.session.get(Employee,x.manager_employee_id).name if x.manager_employee_id and db.session.get(Employee,x.manager_employee_id) else "")} for x in items])
 @app.post("/api/sites")
 @roles("Director")
 def site_create():
@@ -231,22 +290,30 @@ def site_create():
         m=db.session.get(Employee,s.manager_employee_id)
         if not m or m.designation!="Manager":return jsonify(error="Assigned employee must be a Manager"),400
         current=Site.query.filter_by(manager_employee_id=m.id,status="Active").count()
-        if current>=int(setting("manager_site_limit",3)):return jsonify(error="Manager has reached the active-site limit"),400
+        if current>=int(setting("manager_site_limit",20)):return jsonify(error="Manager has reached the 20-site limit"),400
     db.session.add(s);db.session.flush()
     if s.manager_employee_id:
         m=db.session.get(Employee,s.manager_employee_id);ids=set(x for x in (m.site_ids or "").split(",") if x);ids.add(s.id);m.site_ids=",".join(ids)
-    set_audit("Site",sid,"Create","Created site");db.session.commit();return jsonify(item=asdict(s)),201
+    set_audit("Site",sid,"Create","Created site");db.session.commit();return jsonify(item={**asdict(s),"manager_name":(db.session.get(Employee,s.manager_employee_id).name if s.manager_employee_id and db.session.get(Employee,s.manager_employee_id) else "")}),201
 @app.put("/api/sites/<sid>")
 @roles("Director")
 def site_update(sid):
     s=db.session.get(Site,sid)
     if not s:return jsonify(error="Site not found"),404
     d=json_body()
-    for k in ("name","address","manager_employee_id","shift","status"):
+    for k in ("name","address","shift","status"):
         if k in d:setattr(s,k,d[k])
+    if "manager_employee_id" in d:
+        mid=(d.get("manager_employee_id") or "").strip() or None
+        m=db.session.get(Employee,mid) if mid else None
+        if mid and (not m or m.designation!="Manager"): return jsonify(error="Assigned employee must be a Manager"),400
+        if mid and mid!=s.manager_employee_id:
+            count=Site.query.filter_by(manager_employee_id=mid,status="Active").filter(Site.id!=sid).count()
+            if count>=int(setting("manager_site_limit",20)): return jsonify(error="Manager has reached the 20-site limit"),400
+        s.manager_employee_id=mid
     for k in ("required_guards","required_supervisors"):
         if k in d:setattr(s,k,int(d[k] or 0))
-    set_audit("Site",sid,"Update","Site updated");db.session.commit();return jsonify(item=asdict(s))
+    set_audit("Site",sid,"Update","Site updated");db.session.commit();return jsonify(item={**asdict(s),"manager_name":(db.session.get(Employee,s.manager_employee_id).name if s.manager_employee_id and db.session.get(Employee,s.manager_employee_id) else "")})
 @app.get("/api/deployments")
 @token_required
 def deployment_list():
@@ -267,6 +334,8 @@ def deployment_create():
 def attendance_list():
     q=Attendance.query.order_by(Attendance.date.desc()).all();allowed=site_ids_for_user()
     if allowed is not None:q=[x for x in q if x.site_id in allowed]
+    if g.user.role=="Manager":
+        q=[x for x in q if (db.session.get(Employee,x.employee_id) and db.session.get(Employee,x.employee_id).manager_employee_id==g.user.employee_id and db.session.get(Site,x.site_id) and db.session.get(Site,x.site_id).manager_employee_id==g.user.employee_id)]
     typ=request.args.get("type")
     if typ:
         designation={"guard":"Security Guard","supervisor":"Supervisor","manager":"Manager"}.get(typ)
@@ -274,7 +343,7 @@ def attendance_list():
             ids={e.id for e in Employee.query.filter_by(designation=designation).all()};q=[x for x in q if x.employee_id in ids]
     return jsonify(items=[asdict(x) for x in q])
 @app.post("/api/attendance")
-@token_required
+@roles("Director","Manager")
 def attendance_create():
     d=json_body()
     try:
@@ -283,7 +352,16 @@ def attendance_create():
         if not e:return jsonify(error="Employee not found"),404
         if not db.session.get(Site,sid):return jsonify(error="Site not found"),404
         if not authorized_site(sid):return jsonify(error="You cannot access this site"),403
-        if sid not in (e.site_ids or "").split(","):return jsonify(error="Employee is not assigned to this site"),400
+        site=db.session.get(Site,sid)
+        if g.user.role=="Manager":
+            if not g.user.employee_id or site.manager_employee_id!=g.user.employee_id:
+                return jsonify(error="Managers can record attendance only for their assigned sites"),403
+            if e.designation not in ("Security Guard","Supervisor") or e.manager_employee_id!=g.user.employee_id:
+                return jsonify(error="Employee is not assigned to your Manager account"),403
+        elif g.user.role!="Director": return jsonify(error="Only Director or assigned Manager can record attendance"),403
+        assigned_site_ids={x.strip() for x in (e.site_ids or "").split(",") if x.strip()}
+        if sid not in assigned_site_ids and not Deployment.query.filter_by(employee_id=eid,site_id=sid,status="Active").first():
+            return jsonify(error="Employee is not assigned to this site. Assign the site in Employee Master first."),400
         if code not in ("P","A","WO","H","OT","WO-OT","CL","SL"):return jsonify(error="Invalid attendance code"),400
         row=Attendance(date=dt,employee_id=eid,site_id=sid,code=code,shift=d.get("shift") or e.shift,ot_hours=float(d.get("ot_hours") or 0),remarks=d.get("remarks"),created_by=g.user.id)
         db.session.add(row);db.session.flush();set_audit("Attendance",row.id,"Create",f"{code} attendance for {eid} on {dt}");db.session.commit()
@@ -309,10 +387,14 @@ def payroll_create():
     calc["status"]="Draft"
     p=Payroll(**calc);db.session.add(p);db.session.flush()
     # Mark eligible advances as recovered against this payroll exactly once.
-    for a in Advance.query.filter_by(employee_id=eid,recovery_month=month,approval_status="Approved").all():
-        if not a.recovered_payroll_id:
-            recover=min(max(0,a.amount-a.recovered_amount),max(0,p.advance_recovery))
-            if recover>0:a.recovered_amount+=recover;a.recovered_payroll_id=p.id
+    remaining_recovery=max(0,p.advance_recovery)
+    for a in Advance.query.filter(Advance.employee_id==eid,Advance.recovery_month<=month,Advance.approval_status=="Approved").order_by(Advance.issue_date.asc()).all():
+        if remaining_recovery<=0: break
+        outstanding=max(0,(a.amount or 0)-(a.recovered_amount or 0))
+        cap=max(0,(a.monthly_recovery or 0) or (a.amount or 0))
+        recover=min(outstanding,cap,remaining_recovery)
+        if recover>0:
+            a.recovered_amount+=recover;a.recovered_payroll_id=p.id;remaining_recovery-=recover
     set_audit("Payroll",p.id,"Create","Generated payroll draft");db.session.commit();return jsonify(item=asdict(p),message="Payroll draft generated"),201
 @app.put("/api/payroll/<pid>")
 @roles("Director")
@@ -337,7 +419,9 @@ def advance_create():
     if not e:return jsonify(error="Employee not found"),404
     amount=float(d.get("amount") or 0)
     if amount<=0:return jsonify(error="Advance must be greater than zero"),400
-    a=Advance(id=next_id("ADV",Advance),employee_id=e.id,issue_date=parse_date(d.get("issue_date") or now_ist_date().isoformat(),True),amount=amount,approval_status=d.get("approval_status","Pending"),recovery_month=d.get("recovery_month") or now_ist_date().strftime("%Y-%m"),notes=d.get("notes"))
+    monthly_recovery=float(d.get("monthly_recovery") or amount)
+    if monthly_recovery<=0:return jsonify(error="Monthly recovery must be greater than zero"),400
+    a=Advance(id=next_id("ADV",Advance),employee_id=e.id,issue_date=parse_date(d.get("issue_date") or now_ist_date().isoformat(),True),amount=amount,monthly_recovery=monthly_recovery,approval_status=d.get("approval_status","Pending"),recovery_month=d.get("recovery_month") or now_ist_date().strftime("%Y-%m"),notes=d.get("notes"))
     db.session.add(a);set_audit("Advance",a.id,"Create","Created advance request");db.session.commit();return jsonify(item=asdict(a)),201
 @app.get("/api/salary-slips")
 @roles("Director")
@@ -364,10 +448,44 @@ def users_create():
     if not username or len(pw)<12:return jsonify(error="Username required; temporary password must be at least 12 characters"),400
     if User.query.filter_by(username=username).first():return jsonify(error="Username already exists"),409
     role=d.get("role","Manager");sites=[x.strip() for x in (d.get("site_ids") or "").split(",") if x.strip()]
-    if role=="Manager" and len(sites)>int(setting("manager_site_limit",3)):return jsonify(error="Manager may have up to three sites"),400
+    if role=="Manager" and len(sites)>int(setting("manager_site_limit",20)):return jsonify(error="Manager may have up to 20 sites"),400
     if any(not db.session.get(Site,s) for s in sites):return jsonify(error="Invalid site ID"),400
-    u=User(username=username,display_name=d.get("display_name",username),role=role,employee_id=d.get("employee_id"),site_ids=",".join(sites),password_hash=generate_password_hash(pw),must_change_password=True)
+    employee_id=(d.get("employee_id") or "").strip() or None
+    if role=="Manager":
+        manager=db.session.get(Employee,employee_id) if employee_id else None
+        if not manager or manager.designation!="Manager": return jsonify(error="Choose the existing Manager employee record"),400
+        if sites and any(db.session.get(Site,s).manager_employee_id not in (None,employee_id) for s in sites): return jsonify(error="A selected site is assigned to another Manager"),400
+        for sid in sites:
+            site=db.session.get(Site,sid);site.manager_employee_id=employee_id
+    u=User(username=username,display_name=d.get("display_name",username),role=role,employee_id=employee_id,site_ids=",".join(sites),password_hash=generate_password_hash(pw),must_change_password=True)
     db.session.add(u);db.session.flush();set_audit("User",u.id,"Create",f"Created {role} account");db.session.commit();return jsonify(item={"id":u.id,"username":u.username,"role":u.role},message="Account created; user must change password"),201
+
+@app.get("/api/lookups")
+@token_required
+def lookups():
+    allowed=site_ids_for_user()
+    employees=Employee.query.filter_by(status="Active").all()
+    sites=Site.query.filter_by(status="Active").all()
+    managers=Employee.query.filter_by(designation="Manager",status="Active").all() if g.user.role=="Director" else []
+    if g.user.role=="Manager":
+        sites=[s for s in sites if s.manager_employee_id==g.user.employee_id]
+        allowed_manager_sites={s.id for s in sites}
+        employees=[e for e in employees if e.designation in ("Security Guard","Supervisor") and e.manager_employee_id==g.user.employee_id and bool({x.strip() for x in (e.site_ids or "").split(",") if x.strip()} & allowed_manager_sites)]
+    elif allowed is not None:
+        employees=[e for e in employees if set((e.site_ids or "").split(","))&allowed]
+        sites=[s for s in sites if s.id in allowed]
+    return jsonify(employees=[{"id":e.id,"name":e.name,"designation":e.designation,"manager_employee_id":e.manager_employee_id,"site_ids":[x.strip() for x in (e.site_ids or "").split(",") if x.strip()]} for e in employees], managers=[{"id":e.id,"name":e.name} for e in managers], sites=[{"id":s.id,"name":s.name,"manager_employee_id":s.manager_employee_id} for s in sites])
+
+@app.get("/api/employees/<eid>/profile")
+@roles("Director")
+def employee_profile(eid):
+    e=db.session.get(Employee,eid)
+    if not e:return jsonify(error="Employee not found"),404
+    attendance=Attendance.query.filter_by(employee_id=eid).order_by(Attendance.date.desc()).all()
+    payroll=Payroll.query.filter_by(employee_id=eid).order_by(Payroll.month.desc()).all()
+    advances=Advance.query.filter_by(employee_id=eid).order_by(Advance.issue_date.desc()).all()
+    return jsonify(employee=employee_payload(e),attendance=[asdict(a) for a in attendance],payroll=[asdict(p) for p in payroll],advances=[asdict(a) for a in advances])
+
 @app.get("/api/audit")
 @roles("Director")
 def audit_list():return jsonify(items=[asdict(x) for x in Audit.query.order_by(Audit.id.desc()).limit(500).all()])
@@ -380,12 +498,12 @@ def attendance_report():
     return jsonify(items=[asdict(x) for x in rows])
 @app.get("/api/settings")
 @roles("Director")
-def settings_get():return jsonify(settings={k:setting(k,v) for k,v in {"salary_divisor":30,"absence_grace_days":2,"manager_site_limit":3,"director_salary":45000,"ot_rate":0,"wo_ot_rate":0,"pf_rate":0,"esi_rate":0}.items()})
+def settings_get():return jsonify(settings={k:setting(k,v) for k,v in {"salary_divisor":30,"absence_grace_days":2,"manager_site_limit":20,"director_salary":45000,"bonus_cut_two_absences":800,"ot_rate":0,"wo_ot_rate":0,"pf_rate":0,"esi_rate":0}.items()})
 @app.put("/api/settings")
 @roles("Director")
 def settings_put():
     d=json_body()
-    allowed={"salary_divisor","absence_grace_days","manager_site_limit","director_salary","ot_rate","wo_ot_rate","pf_rate","esi_rate"}
+    allowed={"salary_divisor","absence_grace_days","manager_site_limit","director_salary","bonus_cut_two_absences","ot_rate","wo_ot_rate","pf_rate","esi_rate"}
     for k,v in d.items():
         if k in allowed:
             row=db.session.get(Setting,k)
@@ -398,12 +516,14 @@ def not_found(e):return jsonify(error="Endpoint not found"),404
 def internal(e):db.session.rollback();return jsonify(error="Internal server error"),500
 def seed():
     db.create_all()
-    defaults={"salary_divisor":"30","absence_grace_days":"2","manager_site_limit":"3","director_salary":"45000","ot_rate":"0","wo_ot_rate":"0","pf_rate":"0","esi_rate":"0"}
+    defaults={"salary_divisor":"30","absence_grace_days":"2","manager_site_limit":"20","director_salary":"45000","bonus_cut_two_absences":"800","ot_rate":"0","wo_ot_rate":"0","pf_rate":"0","esi_rate":"0"}
     for k,v in defaults.items():
         if not db.session.get(Setting,k):db.session.add(Setting(key=k,value=v))
     username=os.getenv("BOOTSTRAP_ADMIN_USERNAME","admin");password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD","")
     if password and not User.query.filter_by(username=username).first():
         db.session.add(User(username=username,display_name="SVSA Director",role="Director",password_hash=generate_password_hash(password),must_change_password=True))
     db.session.commit()
-with app.app_context():seed()
+with app.app_context():
+    seed()
+    migrate_additive_columns()
 if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT",5000)),debug=False)
