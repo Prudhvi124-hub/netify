@@ -653,12 +653,33 @@ def users_update(uid):
             if site.manager_employee_id not in (None,employee_id):return jsonify(error=f"Site {site.name} is assigned to another Manager"),409
     password=d.get("temporary_password")
     if password and len(password)<12:return jsonify(error="Password must be at least 12 characters"),400
+    # Release site ownership that was removed from this Manager's selection
+    # or when the account is no longer a Manager.
+    old_manager_employee_id=u.employee_id if u.role=="Manager" else None
+    desired_sites=set(sites) if role=="Manager" and employee_id else set()
+    if old_manager_employee_id:
+        old_manager= db.session.get(Employee,old_manager_employee_id)
+        for old_site in Site.query.filter_by(manager_employee_id=old_manager_employee_id).all():
+            if old_site.id not in desired_sites:
+                old_site.manager_employee_id=None
+                if old_manager:
+                    old_ids=[x.strip() for x in (old_manager.site_ids or "").split(",") if x.strip() and x.strip()!=old_site.id]
+                    old_manager.site_ids=",".join(old_ids)
     u.username=username;u.display_name=d.get("display_name",u.display_name);u.role=role;u.employee_id=employee_id;u.site_ids=",".join(sites)
     if password:
         u.password_hash=generate_password_hash(password);u.must_change_password=True
-    if "active" in d:u.active=bool(d["active"])
+    if "active" in d:
+        active_value=d["active"]
+        u.active=active_value if isinstance(active_value,bool) else str(active_value).strip().lower() in ("true","1","yes","on")
     if role=="Manager":
-        for sid in sites:db.session.get(Site,sid).manager_employee_id=employee_id
+        new_manager=db.session.get(Employee,employee_id)
+        for sid in sites:
+            assigned_site=db.session.get(Site,sid)
+            assigned_site.manager_employee_id=employee_id
+            if new_manager:
+                new_ids=[x.strip() for x in (new_manager.site_ids or "").split(",") if x.strip()]
+                if sid not in new_ids:new_ids.append(sid)
+                new_manager.site_ids=",".join(new_ids)
     set_audit("User",uid,"Update","Updated user account and optional password")
     db.session.commit()
     return jsonify(item={"id":u.id,"username":u.username,"display_name":u.display_name,"role":u.role,"employee_id":u.employee_id,"site_ids":u.site_ids,"active":u.active,"must_change_password":u.must_change_password},message="User updated"+("; password changed and must be changed at next login" if password else ""))
