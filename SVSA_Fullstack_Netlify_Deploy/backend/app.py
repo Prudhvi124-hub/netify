@@ -296,27 +296,31 @@ def employee_delete(eid):
     if not e:return jsonify(error="Employee not found"),404
     if e.designation=="Director":
         return jsonify(error="Director employee records cannot be deleted"),409
-    linked=(Attendance.query.filter_by(employee_id=eid).first() or
-            Payroll.query.filter_by(employee_id=eid).first() or
-            Advance.query.filter_by(employee_id=eid).first() or
-            Deployment.query.filter_by(employee_id=eid).first() or
-            User.query.filter_by(employee_id=eid).first() or
-            Verification.query.filter_by(employee_id=eid).first() or
-            Site.query.filter_by(manager_employee_id=eid).first() or
-            Employee.query.filter_by(manager_employee_id=eid).first())
+    if User.query.filter_by(id=g.user.id,employee_id=eid).first():
+        return jsonify(error="You cannot delete the employee record linked to your signed-in Director account"),409
     try:
-        if linked:
-            e.status="Inactive"
-            # Disable associated logins when staff are deactivated.
-            for account in User.query.filter_by(employee_id=eid).all():
-                account.active=False
-            set_audit("Employee",eid,"Deactivate","Deactivated employee with linked historical or assignment records")
-            db.session.commit()
-            return jsonify(message="Employee has linked records and was deactivated to preserve history",deactivated=True,item=employee_payload(e))
+        # Employee deletion is a Director-only permanent cascade.
+        # Clear manager/site references first, then remove dependent records.
+        for subordinate in Employee.query.filter_by(manager_employee_id=eid).all():
+            subordinate.manager_employee_id=None
+        for site in Site.query.filter_by(manager_employee_id=eid).all():
+            site.manager_employee_id=None
+        for account in User.query.filter_by(employee_id=eid).all():
+            db.session.delete(account)
+        for attendance in Attendance.query.filter_by(employee_id=eid).all():
+            db.session.delete(attendance)
+        for payroll in Payroll.query.filter_by(employee_id=eid).all():
+            db.session.delete(payroll)
+        for advance in Advance.query.filter_by(employee_id=eid).all():
+            db.session.delete(advance)
+        for deployment in Deployment.query.filter_by(employee_id=eid).all():
+            db.session.delete(deployment)
+        for verification in Verification.query.filter_by(employee_id=eid).all():
+            db.session.delete(verification)
         db.session.delete(e)
-        set_audit("Employee",eid,"Delete","Deleted employee without linked records")
+        set_audit("Employee",eid,"Delete","Permanently deleted employee and related records")
         db.session.commit()
-        return jsonify(message="Employee deleted",deleted=True)
+        return jsonify(message="Employee and all related records permanently deleted",deleted=True)
     except Exception as ex:
         db.session.rollback()
         return jsonify(error="Could not delete employee safely",details=str(ex)),400
@@ -363,12 +367,50 @@ def site_update(sid):
     for k in ("required_guards","required_supervisors"):
         if k in d:setattr(s,k,int(d[k] or 0))
     set_audit("Site",sid,"Update","Site updated");db.session.commit();return jsonify(item={**asdict(s),"manager_name":(db.session.get(Employee,s.manager_employee_id).name if s.manager_employee_id and db.session.get(Employee,s.manager_employee_id) else "")})
+@app.delete("/api/sites/<sid>")
+@roles("Director")
+def site_delete(sid):
+    site=db.session.get(Site,sid)
+    if not site:return jsonify(error="Site not found"),404
+    try:
+        attendance=Attendance.query.filter_by(site_id=sid).all()
+        affected={(x.employee_id,x.date.strftime("%Y-%m")) for x in attendance}
+        for row in attendance:db.session.delete(row)
+        for row in Deployment.query.filter_by(site_id=sid).all():db.session.delete(row)
+        for emp in Employee.query.all():
+            ids=[x.strip() for x in (emp.site_ids or "").split(",") if x.strip() and x.strip()!=sid]
+            emp.site_ids=",".join(ids)
+        for account in User.query.all():
+            ids=[x.strip() for x in (account.site_ids or "").split(",") if x.strip() and x.strip()!=sid]
+            account.site_ids=",".join(ids)
+        db.session.flush()
+        for eid,month in affected:
+            payroll=Payroll.query.filter_by(employee_id=eid,month=month).first()
+            if payroll:payroll.requires_review=True
+        db.session.delete(site)
+        set_audit("Site",sid,"Delete","Permanently deleted site and linked attendance/deployment records")
+        db.session.commit()
+        return jsonify(message="Site and linked attendance/deployment records permanently deleted",deleted=True)
+    except Exception as ex:
+        db.session.rollback()
+        return jsonify(error="Could not delete site",details=str(ex)),400
+
 @app.get("/api/deployments")
 @token_required
 def deployment_list():
     q=Deployment.query.all();allowed=site_ids_for_user()
     if allowed is not None:q=[x for x in q if x.site_id in allowed]
     return jsonify(items=[labelled_record(x) for x in q])
+@app.delete("/api/deployments/<did>")
+@roles("Director")
+def deployment_delete(did):
+    row=db.session.get(Deployment,did)
+    if not row:return jsonify(error="Deployment not found"),404
+    db.session.delete(row)
+    set_audit("Site Deployment",did,"Delete","Permanently deleted deployment record")
+    db.session.commit()
+    return jsonify(message="Deployment deleted",deleted=True)
+
 @app.post("/api/deployments")
 @roles("Director")
 def deployment_create():
@@ -426,6 +468,18 @@ def attendance_create():
         if payroll:payroll.requires_review=True;db.session.commit()
         return jsonify(item=labelled_record(row),message="Attendance saved" if created else "Attendance already existed; record updated"),201 if created else 200
     except Exception as ex:db.session.rollback();return jsonify(error=str(ex)),400
+@app.delete("/api/attendance/<int:aid>")
+@roles("Director")
+def attendance_delete(aid):
+    row=db.session.get(Attendance,aid)
+    if not row:return jsonify(error="Attendance record not found"),404
+    payroll=Payroll.query.filter_by(employee_id=row.employee_id,month=row.date.strftime("%Y-%m")).first()
+    db.session.delete(row)
+    if payroll:payroll.requires_review=True
+    set_audit("Attendance",aid,"Delete","Permanently deleted attendance record")
+    db.session.commit()
+    return jsonify(message="Attendance deleted; related payroll marked for review" if payroll else "Attendance deleted",deleted=True)
+
 @app.get("/api/payroll")
 @roles("Director")
 def payroll_list():return jsonify(items=[labelled_record(x) for x in Payroll.query.order_by(Payroll.month.desc()).all()])
@@ -465,6 +519,30 @@ def payroll_update(pid):
         p.status=d["status"]
     if p.requires_review and p.status in ("Approved","Paid"):return jsonify(error="Recalculate and review this payroll before approval"),409
     set_audit("Payroll",pid,"Update","Payroll status updated");db.session.commit();return jsonify(item=asdict(p))
+@app.delete("/api/payroll/<pid>")
+@roles("Director")
+def payroll_delete(pid):
+    row=db.session.get(Payroll,pid)
+    if not row:return jsonify(error="Payroll record not found"),404
+    try:
+        # Best-effort reversal for advances whose latest recovery marker points to this payroll.
+        remaining=max(0,float(row.advance_recovery or 0))
+        eligible=Advance.query.filter_by(employee_id=row.employee_id,recovered_payroll_id=pid).order_by(Advance.issue_date.desc()).all()
+        for advance in eligible:
+            if remaining<=0:break
+            cap=max(0,float(advance.monthly_recovery or advance.amount or 0))
+            reverse=min(float(advance.recovered_amount or 0),cap,remaining)
+            advance.recovered_amount=max(0,float(advance.recovered_amount or 0)-reverse)
+            advance.recovered_payroll_id=None
+            remaining-=reverse
+        db.session.delete(row)
+        set_audit("Payroll",pid,"Delete","Permanently deleted payroll record and reversed identifiable latest advance recoveries")
+        db.session.commit()
+        return jsonify(message="Payroll record deleted",deleted=True)
+    except Exception as ex:
+        db.session.rollback()
+        return jsonify(error="Could not delete payroll record",details=str(ex)),400
+
 @app.get("/api/advances")
 @roles("Director")
 def advances_list():return jsonify(items=[labelled_record(x) for x in Advance.query.all()])
@@ -479,6 +557,16 @@ def advance_create():
     if monthly_recovery<=0:return jsonify(error="Monthly recovery must be greater than zero"),400
     a=Advance(id=next_id("ADV",Advance),employee_id=e.id,issue_date=parse_date(d.get("issue_date") or now_ist_date().isoformat(),True),amount=amount,monthly_recovery=monthly_recovery,approval_status=d.get("approval_status","Pending"),recovery_month=d.get("recovery_month") or now_ist_date().strftime("%Y-%m"),notes=d.get("notes"))
     db.session.add(a);set_audit("Advance",a.id,"Create","Created advance request");db.session.commit();return jsonify(item=asdict(a)),201
+@app.delete("/api/advances/<aid>")
+@roles("Director")
+def advance_delete(aid):
+    row=db.session.get(Advance,aid)
+    if not row:return jsonify(error="Advance record not found"),404
+    db.session.delete(row)
+    set_audit("Advance",aid,"Delete","Permanently deleted advance record")
+    db.session.commit()
+    return jsonify(message="Advance deleted",deleted=True)
+
 @app.get("/api/salary-slips")
 @roles("Director")
 def salary_slips():return jsonify(items=[labelled_record(x) for x in Payroll.query.filter(Payroll.status.in_(["Approved","Paid"])).all()])
@@ -488,6 +576,16 @@ def statutory():return jsonify(items=[])
 @app.get("/api/verification")
 @roles("Director")
 def verification_list():return jsonify(items=[labelled_record(x) for x in Verification.query.all()])
+@app.delete("/api/verification/<int:vid>")
+@roles("Director")
+def verification_delete(vid):
+    row=db.session.get(Verification,vid)
+    if not row:return jsonify(error="Verification record not found"),404
+    db.session.delete(row)
+    set_audit("Verification",vid,"Delete","Permanently deleted verification record")
+    db.session.commit()
+    return jsonify(message="Verification record deleted",deleted=True)
+
 @app.post("/api/verification")
 @roles("Director")
 def verification_create():
@@ -509,7 +607,7 @@ def users_create():
     d=json_body();username=d.get("username","").strip();pw=d.get("temporary_password","")
     if not username or len(pw)<12:return jsonify(error="Username required; temporary password must be at least 12 characters"),400
     if User.query.filter_by(username=username).first():return jsonify(error="Username already exists"),409
-    role=d.get("role","Manager");sites=[x.strip() for x in (d.get("site_ids") or "").split(",") if x.strip()]
+    role=d.get("role","Manager");sites_value=d.get("site_ids") or "";sites=[str(x).strip() for x in sites_value if str(x).strip()] if isinstance(sites_value,list) else [x.strip() for x in sites_value.split(",") if x.strip()]
     if role=="Manager" and len(sites)>int(setting("manager_site_limit",20)):return jsonify(error="Manager may have up to 20 sites"),400
     if any(not db.session.get(Site,s) for s in sites):return jsonify(error="Invalid site ID"),400
     employee_id=(d.get("employee_id") or "").strip() or None
@@ -547,12 +645,33 @@ def users_update(uid):
             if site.manager_employee_id not in (None,employee_id):return jsonify(error=f"Site {site.name} is assigned to another Manager"),409
     password=d.get("temporary_password")
     if password and len(password)<12:return jsonify(error="Password must be at least 12 characters"),400
+    # Release site ownership that was removed from this Manager's selection
+    # or when the account is no longer a Manager.
+    old_manager_employee_id=u.employee_id if u.role=="Manager" else None
+    desired_sites=set(sites) if role=="Manager" and employee_id else set()
+    if old_manager_employee_id:
+        old_manager= db.session.get(Employee,old_manager_employee_id)
+        for old_site in Site.query.filter_by(manager_employee_id=old_manager_employee_id).all():
+            if old_site.id not in desired_sites:
+                old_site.manager_employee_id=None
+                if old_manager:
+                    old_ids=[x.strip() for x in (old_manager.site_ids or "").split(",") if x.strip() and x.strip()!=old_site.id]
+                    old_manager.site_ids=",".join(old_ids)
     u.username=username;u.display_name=d.get("display_name",u.display_name);u.role=role;u.employee_id=employee_id;u.site_ids=",".join(sites)
     if password:
         u.password_hash=generate_password_hash(password);u.must_change_password=True
-    if "active" in d:u.active=bool(d["active"])
+    if "active" in d:
+        active_value=d["active"]
+        u.active=active_value if isinstance(active_value,bool) else str(active_value).strip().lower() in ("true","1","yes","on")
     if role=="Manager":
-        for sid in sites:db.session.get(Site,sid).manager_employee_id=employee_id
+        new_manager=db.session.get(Employee,employee_id)
+        for sid in sites:
+            assigned_site=db.session.get(Site,sid)
+            assigned_site.manager_employee_id=employee_id
+            if new_manager:
+                new_ids=[x.strip() for x in (new_manager.site_ids or "").split(",") if x.strip()]
+                if sid not in new_ids:new_ids.append(sid)
+                new_manager.site_ids=",".join(new_ids)
     set_audit("User",uid,"Update","Updated user account and optional password")
     db.session.commit()
     return jsonify(item={"id":u.id,"username":u.username,"display_name":u.display_name,"role":u.role,"employee_id":u.employee_id,"site_ids":u.site_ids,"active":u.active,"must_change_password":u.must_change_password},message="User updated"+("; password changed and must be changed at next login" if password else ""))
@@ -562,11 +681,11 @@ def users_update(uid):
 def users_delete(uid):
     u=db.session.get(User,uid)
     if not u:return jsonify(error="User account not found"),404
-    if u.id==g.user.id:return jsonify(error="You cannot deactivate your own signed-in account"),409
-    u.active=False
-    set_audit("User",uid,"Deactivate","Deactivated user account")
+    if u.id==g.user.id:return jsonify(error="You cannot delete your own signed-in account"),409
+    db.session.delete(u)
+    set_audit("User",uid,"Delete","Permanently deleted user account")
     db.session.commit()
-    return jsonify(message="User account deactivated",deactivated=True)
+    return jsonify(message="User account permanently deleted",deleted=True)
 
 @app.get("/api/lookups")
 @token_required
