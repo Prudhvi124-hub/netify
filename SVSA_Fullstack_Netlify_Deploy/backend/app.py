@@ -14,8 +14,22 @@ app.config["SQLALCHEMY_DATABASE_URI"]=db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"]=False
 app.config["JWT_SECRET"]=os.getenv("JWT_SECRET","local-development-change-me")
 db=SQLAlchemy(app)
-origin=os.getenv("FRONTEND_ORIGIN","http://localhost:5173")
-CORS(app,origins=[origin,"http://localhost:5173"],supports_credentials=True)
+origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173").strip().rstrip("/")
+# Allow the configured frontend, local development, and Netlify deploy-preview URLs
+# for this site (for example: <deploy-id>--svsaagency1.netlify.app).
+netlify_preview_origin = r"^https://([a-z0-9-]+--)?svsaagency1\.netlify\.app$"
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": [origin, "http://localhost:5173", netlify_preview_origin],
+            "allow_headers": ["Content-Type", "Authorization"],
+            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        }
+    },
+    supports_credentials=False,
+    max_age=600,
+)
 
 class User(db.Model):
     id=db.Column(db.Integer,primary_key=True); username=db.Column(db.String(80),unique=True,nullable=False)
