@@ -315,11 +315,6 @@ def employee_delete(eid):
             if account.id==g.user.id:
                 return jsonify(error="You cannot delete the employee record linked to your signed-in Director account"),409
             db.session.delete(account)
-        for account in User.query.all():
-            ids=[x.strip() for x in (account.site_ids or "").split(",") if x.strip() and x.strip() not in {
-                site.id for site in Site.query.filter_by(manager_employee_id=eid).all()
-            }]
-            account.site_ids=",".join(ids)
         for attendance in Attendance.query.filter_by(employee_id=eid).all():
             db.session.delete(attendance)
         for payroll in Payroll.query.filter_by(employee_id=eid).all():
@@ -620,7 +615,7 @@ def users_create():
     d=json_body();username=d.get("username","").strip();pw=d.get("temporary_password","")
     if not username or len(pw)<12:return jsonify(error="Username required; temporary password must be at least 12 characters"),400
     if User.query.filter_by(username=username).first():return jsonify(error="Username already exists"),409
-    role=d.get("role","Manager");sites=[x.strip() for x in (d.get("site_ids") or "").split(",") if x.strip()]
+    role=d.get("role","Manager");sites_value=d.get("site_ids") or "";sites=[str(x).strip() for x in sites_value if str(x).strip()] if isinstance(sites_value,list) else [x.strip() for x in sites_value.split(",") if x.strip()]
     if role=="Manager" and len(sites)>int(setting("manager_site_limit",20)):return jsonify(error="Manager may have up to 20 sites"),400
     if any(not db.session.get(Site,s) for s in sites):return jsonify(error="Invalid site ID"),400
     employee_id=(d.get("employee_id") or "").strip() or None
