@@ -301,11 +301,16 @@ def employee_delete(eid):
             Advance.query.filter_by(employee_id=eid).first() or
             Deployment.query.filter_by(employee_id=eid).first() or
             User.query.filter_by(employee_id=eid).first() or
-            Verification.query.filter_by(employee_id=eid).first())
+            Verification.query.filter_by(employee_id=eid).first() or
+            Site.query.filter_by(manager_employee_id=eid).first() or
+            Employee.query.filter_by(manager_employee_id=eid).first())
     try:
         if linked:
             e.status="Inactive"
-            set_audit("Employee",eid,"Deactivate","Deactivated employee with historical records")
+            # Disable associated logins when staff are deactivated.
+            for account in User.query.filter_by(employee_id=eid).all():
+                account.active=False
+            set_audit("Employee",eid,"Deactivate","Deactivated employee with linked historical or assignment records")
             db.session.commit()
             return jsonify(message="Employee has linked records and was deactivated to preserve history",deactivated=True,item=employee_payload(e))
         db.session.delete(e)
@@ -491,7 +496,13 @@ def verification_create():
     db.session.add(v);set_audit("Verification",v.employee_id,"Create","Updated verification status");db.session.commit();return jsonify(item=asdict(v)),201
 @app.get("/api/users")
 @roles("Director")
-def users_list():return jsonify(items=[{"id":u.id,"username":u.username,"display_name":u.display_name,"role":u.role,"employee_id":u.employee_id,"site_ids":u.site_ids,"active":u.active,"must_change_password":u.must_change_password} for u in User.query.all()])
+def users_list():
+    items=[]
+    for u in User.query.all():
+        emp=db.session.get(Employee,u.employee_id) if u.employee_id else None
+        site_ids=[x.strip() for x in (u.site_ids or "").split(",") if x.strip()]
+        items.append({"id":u.id,"username":u.username,"display_name":u.display_name,"role":u.role,"employee_id":u.employee_id,"employee_name":emp.name if emp else "","site_ids":u.site_ids,"site_names":[site.name for sid in site_ids if (site:=db.session.get(Site,sid))],"active":u.active,"must_change_password":u.must_change_password})
+    return jsonify(items=items)
 @app.post("/api/users")
 @roles("Director")
 def users_create():
