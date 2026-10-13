@@ -296,14 +296,8 @@ def employee_delete(eid):
     if not e:return jsonify(error="Employee not found"),404
     if e.designation=="Director":
         return jsonify(error="Director employee records cannot be deleted"),409
-    linked=(Attendance.query.filter_by(employee_id=eid).first() or
-            Payroll.query.filter_by(employee_id=eid).first() or
-            Advance.query.filter_by(employee_id=eid).first() or
-            Deployment.query.filter_by(employee_id=eid).first() or
-            User.query.filter_by(employee_id=eid).first() or
-            Verification.query.filter_by(employee_id=eid).first() or
-            Site.query.filter_by(manager_employee_id=eid).first() or
-            Employee.query.filter_by(manager_employee_id=eid).first())
+    if User.query.filter_by(id=g.user.id,employee_id=eid).first():
+        return jsonify(error="You cannot delete the employee record linked to your signed-in Director account"),409
     try:
         # Employee deletion is a Director-only permanent cascade.
         # Clear manager/site references first, then remove dependent records.
@@ -312,8 +306,6 @@ def employee_delete(eid):
         for site in Site.query.filter_by(manager_employee_id=eid).all():
             site.manager_employee_id=None
         for account in User.query.filter_by(employee_id=eid).all():
-            if account.id==g.user.id:
-                return jsonify(error="You cannot delete the employee record linked to your signed-in Director account"),409
             db.session.delete(account)
         for attendance in Attendance.query.filter_by(employee_id=eid).all():
             db.session.delete(attendance)
