@@ -1,4 +1,4 @@
-import os, datetime, secrets
+import os, datetime, secrets, json
 from functools import wraps
 from flask import Flask, request, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
@@ -67,6 +67,10 @@ class Payroll(db.Model):
     pf_deduction=db.Column(db.Float,default=0); esi_deduction=db.Column(db.Float,default=0); advance_recovery=db.Column(db.Float,default=0)
     other_deductions=db.Column(db.Float,default=0); gross_pay=db.Column(db.Float,default=0); net_pay=db.Column(db.Float,default=0)
     status=db.Column(db.String(20),default="Draft"); requires_review=db.Column(db.Boolean,default=False)
+    monthly_basic_salary=db.Column(db.Float,default=0); monthly_food_allowance=db.Column(db.Float,default=0)
+    daily_rate=db.Column(db.Float,default=0); present_days=db.Column(db.Integer,default=0)
+    paid_days=db.Column(db.Integer,default=0); recorded_days=db.Column(db.Integer,default=0)
+    advance_recovery_details=db.Column(db.Text,default="[]")
     __table_args__=(UniqueConstraint("employee_id","month",name="uq_payroll_employee_month"),)
 class Verification(db.Model):
     id=db.Column(db.Integer,primary_key=True); employee_id=db.Column(db.String(40),nullable=False)
@@ -140,6 +144,17 @@ def employee_payload(e):
 def labelled_record(obj):
     """Serialize a record and add human-readable related names for tables/reports."""
     d=asdict(obj)
+    if isinstance(obj,Payroll):
+        try:
+            plan=json.loads(obj.advance_recovery_details or "[]")
+            labels=[]
+            for item in plan:
+                advance=db.session.get(Advance,item.get("advance_id"))
+                name=advance.id if advance else item.get("advance_id","Advance")
+                labels.append(f"{name}: ₹{float(item.get('amount') or 0):,.2f}")
+            d["advance_recovery_details"]="; ".join(labels) if labels else "None"
+        except (TypeError,ValueError,AttributeError):
+            d["advance_recovery_details"]=obj.advance_recovery_details or "None"
     eid=d.get("employee_id")
     sid=d.get("site_id")
     emp=db.session.get(Employee,eid) if eid else None
@@ -154,28 +169,58 @@ def labelled_record(obj):
         d["site_names"]=[site.name for sid in ids if (site:=db.session.get(Site,sid))]
     return d
 
+def advance_recovery_plan(employee_id,month,max_total):
+    """Plan approved advance instalments without exceeding available take-home pay."""
+    plan=[]
+    remaining=max(0.0,float(max_total or 0))
+    advances=Advance.query.filter(Advance.employee_id==employee_id,Advance.recovery_month<=month,Advance.approval_status=="Approved").order_by(Advance.issue_date.asc()).all()
+    for advance in advances:
+        if remaining<=0:break
+        outstanding=max(0.0,float(advance.amount or 0)-float(advance.recovered_amount or 0))
+        cap=max(0.0,float(advance.monthly_recovery or 0) or float(advance.amount or 0))
+        recover=round(min(outstanding,cap,remaining),2)
+        if recover>0:
+            plan.append({"advance_id":advance.id,"amount":recover})
+            remaining=round(remaining-recover,2)
+    return plan
+
 def payroll_calc(emp,month):
     first=datetime.date.fromisoformat(month+"-01")
     next_month=(first.replace(day=28)+datetime.timedelta(days=4)).replace(day=1)
     rows=Attendance.query.filter(Attendance.employee_id==emp.id,Attendance.date>=first,Attendance.date<next_month).all()
-    absent=sum(1 for x in rows if x.code=="A")
-    grace=max(0,int(setting("absence_grace_days",2)))
+    # P, WO, H, OT, WO-OT, CL and SL count as paid days. A is unpaid from day one.
+    paid_codes={"P","WO","H","OT","WO-OT","CL","SL"}
+    present_codes={"P","OT","WO-OT"}
+    present_days=sum(1 for row in rows if row.code in present_codes)
+    absent=sum(1 for row in rows if row.code=="A")
+    paid_days=sum(1 for row in rows if row.code in paid_codes)
+    recorded_days=len(rows)
     divisor=max(float(setting("salary_divisor",30)),1)
-    chargeable=max(0,absent-grace)
-    absence=round(chargeable*(emp.basic_salary or 0)/divisor,2)
+    monthly_basic=round(float(emp.basic_salary or 0),2)
+    monthly_food=round(float(emp.food_allowance or 0),2)
+    daily_rate=round((monthly_basic+monthly_food)/divisor,2)
+    earned_basic=round(monthly_basic/divisor*paid_days,2)
+    earned_food=round(monthly_food/divisor*paid_days,2)
+    # Informational loss; paid-day prorating already removes these wages, so do not deduct it twice.
+    absence_loss=round(absent*daily_rate,2)
     bonus=float(emp.attendance_bonus or 0)
     if absent>=3: bonus=0
     elif absent==2: bonus=max(0,bonus-float(setting("bonus_cut_two_absences",800)))
-    payroll_id=f"{emp.id}:{month}"
-    advs=Advance.query.filter(Advance.employee_id==emp.id,Advance.recovery_month<=month,Advance.approval_status=="Approved").order_by(Advance.issue_date.asc()).all()
-    adv_amount=sum(min(max(0,(a.amount or 0)-(a.recovered_amount or 0)),max(0,(a.monthly_recovery or 0) or (a.amount or 0))) for a in advs)
     ot_rate=float(setting("ot_rate",0));wo_rate=float(setting("wo_ot_rate",0))
-    ot_pay=round(sum((x.ot_hours or 0)*(wo_rate if x.code=="WO-OT" else ot_rate) for x in rows if x.code in ("OT","WO-OT")),2)
-    basic=float(emp.basic_salary or 0);food=float(emp.food_allowance or 0)
-    pf=round(basic*float(setting("pf_rate",0))/100,2);esi=round(basic*float(setting("esi_rate",0))/100,2)
-    gross=round(basic+food+bonus+ot_pay,2)
-    net=round(gross-absence-pf-esi-adv_amount,2)
-    return dict(id=payroll_id,employee_id=emp.id,month=month,basic_salary=basic,food_allowance=food,bonus_payable=bonus,ot_pay=ot_pay,absence_days=absent,absence_deduction=absence,pf_deduction=pf,esi_deduction=esi,advance_recovery=adv_amount,other_deductions=0,gross_pay=gross,net_pay=net,status="Draft",requires_review=False)
+    ot_pay=round(sum((row.ot_hours or 0)*(wo_rate if row.code=="WO-OT" else ot_rate) for row in rows if row.code in ("OT","WO-OT")),2)
+    pf=round(earned_basic*float(setting("pf_rate",0))/100,2)
+    esi=round(earned_basic*float(setting("esi_rate",0))/100,2)
+    gross=round(earned_basic+earned_food+bonus+ot_pay,2)
+    plan=advance_recovery_plan(emp.id,month,max(0.0,gross-pf-esi))
+    adv_amount=round(sum(item["amount"] for item in plan),2)
+    net=round(gross-pf-esi-adv_amount,2)
+    return dict(id=f"{emp.id}:{month}",employee_id=emp.id,month=month,
+        monthly_basic_salary=monthly_basic,monthly_food_allowance=monthly_food,daily_rate=daily_rate,
+        present_days=present_days,paid_days=paid_days,recorded_days=recorded_days,
+        basic_salary=earned_basic,food_allowance=earned_food,bonus_payable=bonus,ot_pay=ot_pay,
+        absence_days=absent,absence_deduction=absence_loss,pf_deduction=pf,esi_deduction=esi,
+        advance_recovery=adv_amount,advance_recovery_details=json.dumps(plan),
+        other_deductions=0,gross_pay=gross,net_pay=net,status="Draft",requires_review=False)
 
 def ensure_site_limit(employee_id,site_ids):
     manager=Employee.query.filter_by(id=employee_id,designation="Manager").first()
@@ -200,6 +245,21 @@ def migrate_additive_columns():
             if "monthly_recovery" not in cols:
                 db.session.execute(text("ALTER TABLE advance ADD COLUMN monthly_recovery FLOAT DEFAULT 0"))
                 db.session.commit()
+        if "payroll" in inspector.get_table_names():
+            cols={c["name"] for c in inspector.get_columns("payroll")}
+            additions={
+                "monthly_basic_salary":"FLOAT DEFAULT 0",
+                "monthly_food_allowance":"FLOAT DEFAULT 0",
+                "daily_rate":"FLOAT DEFAULT 0",
+                "present_days":"INTEGER DEFAULT 0",
+                "paid_days":"INTEGER DEFAULT 0",
+                "recorded_days":"INTEGER DEFAULT 0",
+                "advance_recovery_details":"TEXT DEFAULT '[]'",
+            }
+            for column, sql_type in additions.items():
+                if column not in cols:
+                    db.session.execute(text(f"ALTER TABLE payroll ADD COLUMN {column} {sql_type}"))
+            db.session.commit()
     except Exception:
         db.session.rollback()
 
@@ -489,23 +549,69 @@ def payroll_create():
     d=json_body();eid=d.get("employee_id");month=d.get("month")
     e=db.session.get(Employee,eid)
     if not e:return jsonify(error="Employee not found"),404
-    if not month or len(month)!=7:return jsonify(error="Payroll month must be YYYY-MM"),400
+    if not month or len(month)!=7 or month[4]!="-":return jsonify(error="Payroll month must be YYYY-MM"),400
+    try:datetime.date.fromisoformat(month+"-01")
+    except ValueError:return jsonify(error="Payroll month must be a valid YYYY-MM month"),400
     existing=Payroll.query.filter_by(employee_id=eid,month=month).first()
-    if existing:return jsonify(error="Payroll already exists for this employee and month"),409
-    calc=payroll_calc(e,month);calc["ot_pay"]=float(d.get("ot_pay") or calc["ot_pay"]);calc["other_deductions"]=float(d.get("other_deductions") or 0)
-    calc["net_pay"]=round(calc["gross_pay"]-calc["absence_deduction"]-calc["pf_deduction"]-calc["esi_deduction"]-calc["advance_recovery"]-calc["other_deductions"],2)
-    calc["status"]="Draft"
+    if existing:return jsonify(error="Payroll already exists for this employee and month. Use Recalculate on a Draft/Reviewed payroll."),409
+    calc=payroll_calc(e,month)
+    if d.get("ot_pay") not in (None,""):calc["ot_pay"]=max(0,float(d["ot_pay"]))
+    calc["other_deductions"]=max(0,float(d.get("other_deductions") or 0))
+    calc["gross_pay"]=round(calc["basic_salary"]+calc["food_allowance"]+calc["bonus_payable"]+calc["ot_pay"],2)
+    available=max(0,calc["gross_pay"]-calc["pf_deduction"]-calc["esi_deduction"]-calc["other_deductions"])
+    plan=advance_recovery_plan(eid,month,available)
+    calc["advance_recovery_details"]=json.dumps(plan)
+    calc["advance_recovery"]=round(sum(item["amount"] for item in plan),2)
+    calc["net_pay"]=round(calc["gross_pay"]-calc["pf_deduction"]-calc["esi_deduction"]-calc["advance_recovery"]-calc["other_deductions"],2)
+    calc["status"]="Draft";calc["requires_review"]=False
     p=Payroll(**calc);db.session.add(p);db.session.flush()
-    # Mark eligible advances as recovered against this payroll exactly once.
-    remaining_recovery=max(0,p.advance_recovery)
-    for a in Advance.query.filter(Advance.employee_id==eid,Advance.recovery_month<=month,Advance.approval_status=="Approved").order_by(Advance.issue_date.asc()).all():
-        if remaining_recovery<=0: break
-        outstanding=max(0,(a.amount or 0)-(a.recovered_amount or 0))
-        cap=max(0,(a.monthly_recovery or 0) or (a.amount or 0))
-        recover=min(outstanding,cap,remaining_recovery)
-        if recover>0:
-            a.recovered_amount+=recover;a.recovered_payroll_id=p.id;remaining_recovery-=recover
-    set_audit("Payroll",p.id,"Create","Generated payroll draft");db.session.commit();return jsonify(item=asdict(p),message="Payroll draft generated"),201
+    for item in plan:
+        advance=db.session.get(Advance,item["advance_id"])
+        if advance:
+            advance.recovered_amount=round(float(advance.recovered_amount or 0)+item["amount"],2)
+            advance.recovered_payroll_id=p.id
+    set_audit("Payroll",p.id,"Create",f"Generated attendance-based payroll with {p.paid_days} paid days")
+    db.session.commit()
+    return jsonify(item=labelled_record(p),message="Payroll draft generated from attendance"),201
+@app.post("/api/payroll/<pid>/recalculate")
+@roles("Director")
+def payroll_recalculate(pid):
+    p=db.session.get(Payroll,pid)
+    if not p:return jsonify(error="Payroll not found"),404
+    if p.status in ("Approved","Paid"):return jsonify(error="Approved or Paid payroll is locked; use an authorized adjustment workflow"),409
+    later=Payroll.query.filter(Payroll.employee_id==p.employee_id,Payroll.month>p.month).first()
+    if later:return jsonify(error="Recalculate only the latest payroll for this employee so advance recoveries remain consistent"),409
+    try:old_plan=json.loads(p.advance_recovery_details or "[]")
+    except (TypeError,ValueError):old_plan=[]
+    if not old_plan and float(p.advance_recovery or 0)>0:
+        return jsonify(error="This older payroll has no advance recovery breakdown. It cannot be recalculated safely; review its advance ledger manually first."),409
+    for item in old_plan:
+        advance=db.session.get(Advance,item.get("advance_id"))
+        if advance:
+            amount=max(0,float(item.get("amount") or 0))
+            advance.recovered_amount=round(max(0,float(advance.recovered_amount or 0)-amount),2)
+            if advance.recovered_payroll_id==p.id:advance.recovered_payroll_id=None
+    emp=db.session.get(Employee,p.employee_id)
+    if not emp:return jsonify(error="Employee not found"),404
+    calc=payroll_calc(emp,p.month)
+    calc["other_deductions"]=max(0,float(p.other_deductions or 0))
+    available=max(0,calc["gross_pay"]-calc["pf_deduction"]-calc["esi_deduction"]-calc["other_deductions"])
+    plan=advance_recovery_plan(emp.id,p.month,available)
+    calc["advance_recovery_details"]=json.dumps(plan)
+    calc["advance_recovery"]=round(sum(item["amount"] for item in plan),2)
+    calc["net_pay"]=round(calc["gross_pay"]-calc["pf_deduction"]-calc["esi_deduction"]-calc["advance_recovery"]-calc["other_deductions"],2)
+    for key,value in calc.items():
+        if key not in ("id","employee_id","month","status","requires_review"):setattr(p,key,value)
+    for item in plan:
+        advance=db.session.get(Advance,item["advance_id"])
+        if advance:
+            advance.recovered_amount=round(float(advance.recovered_amount or 0)+item["amount"],2)
+            advance.recovered_payroll_id=p.id
+    p.status="Draft";p.requires_review=False
+    set_audit("Payroll",p.id,"Recalculate",f"Recalculated from attendance: {p.paid_days} paid days, {p.absence_days} absent days")
+    db.session.commit()
+    return jsonify(item=labelled_record(p),message="Payroll recalculated from attendance and advance ledger")
+
 @app.put("/api/payroll/<pid>")
 @roles("Director")
 def payroll_update(pid):
@@ -725,12 +831,12 @@ def attendance_report():
     return jsonify(items=[labelled_record(x) for x in rows])
 @app.get("/api/settings")
 @roles("Director")
-def settings_get():return jsonify(settings={k:setting(k,v) for k,v in {"salary_divisor":30,"absence_grace_days":2,"manager_site_limit":20,"director_salary":45000,"bonus_cut_two_absences":800,"ot_rate":0,"wo_ot_rate":0,"pf_rate":0,"esi_rate":0}.items()})
+def settings_get():return jsonify(settings={k:(0 if k=="absence_grace_days" else setting(k,v)) for k,v in {"salary_divisor":30,"absence_grace_days":0,"manager_site_limit":20,"director_salary":45000,"bonus_cut_two_absences":800,"ot_rate":0,"wo_ot_rate":0,"pf_rate":0,"esi_rate":0}.items()})
 @app.put("/api/settings")
 @roles("Director")
 def settings_put():
     d=json_body()
-    allowed={"salary_divisor","absence_grace_days","manager_site_limit","director_salary","bonus_cut_two_absences","ot_rate","wo_ot_rate","pf_rate","esi_rate"}
+    allowed={"salary_divisor","manager_site_limit","director_salary","bonus_cut_two_absences","ot_rate","wo_ot_rate","pf_rate","esi_rate"}
     for k,v in d.items():
         if k in allowed:
             row=db.session.get(Setting,k)
@@ -743,7 +849,7 @@ def not_found(e):return jsonify(error="Endpoint not found"),404
 def internal(e):db.session.rollback();return jsonify(error="Internal server error"),500
 def seed():
     db.create_all()
-    defaults={"salary_divisor":"30","absence_grace_days":"2","manager_site_limit":"20","director_salary":"45000","bonus_cut_two_absences":"800","ot_rate":"0","wo_ot_rate":"0","pf_rate":"0","esi_rate":"0"}
+    defaults={"salary_divisor":"30","absence_grace_days":"0","manager_site_limit":"20","director_salary":"45000","bonus_cut_two_absences":"800","ot_rate":"0","wo_ot_rate":"0","pf_rate":"0","esi_rate":"0"}
     for k,v in defaults.items():
         if not db.session.get(Setting,k):db.session.add(Setting(key=k,value=v))
     username=os.getenv("BOOTSTRAP_ADMIN_USERNAME","admin");password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD","")
@@ -753,4 +859,8 @@ def seed():
 with app.app_context():
     seed()
     migrate_additive_columns()
+    grace_setting=db.session.get(Setting,"absence_grace_days")
+    if grace_setting and grace_setting.value=="2":
+        grace_setting.value="0"
+        db.session.commit()
 if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT",5000)),debug=False)
